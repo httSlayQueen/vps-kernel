@@ -422,6 +422,15 @@ jobs:
         # 6. 特殊云厂商网卡补全 (独立服务器、Oracle Cloud、高防机房常见)
         scripts/config --enable CONFIG_NET_VENDOR_MELLANOX
         scripts/config --enable CONFIG_MLX4_CORE
+        
+        # ==========================================
+        # 模块十二：ufw 防火墙支持，且可以搭配 ipset 使用
+        # ==========================================
+        scripts/config --module CONFIG_NETFILTER_XT_SET
+        scripts/config --module CONFIG_NETFILTER_XT_MATCH_LIMIT
+        scripts/config --module CONFIG_NETFILTER_XT_MATCH_HL
+        scripts/config --module CONFIG_IP6_NF_TARGET_HL
+        scripts/config --module CONFIG_IP6_NF_MATCH_RT
        
         # 重新生成最终配置
         make olddefconfig
