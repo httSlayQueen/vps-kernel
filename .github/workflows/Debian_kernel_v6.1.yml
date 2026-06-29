@@ -426,6 +426,7 @@ jobs:
         # ==========================================
         # 模块十二：ufw 防火墙支持，且可以搭配 ipset 使用
         # ==========================================
+        scripts/config --enable CONFIG_NETFILTER_ADVANCED
         scripts/config --module CONFIG_NETFILTER_XT_SET
         scripts/config --module CONFIG_NETFILTER_XT_MATCH_LIMIT
         scripts/config --module CONFIG_NETFILTER_XT_MATCH_HL
