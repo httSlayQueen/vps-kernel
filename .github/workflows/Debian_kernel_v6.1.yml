@@ -99,6 +99,8 @@ jobs:
         sudo apt-get install -y build-essential bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison zstd xz-utils wget curl aria2 debhelper libdw-dev rsync fakeroot
 
     - name: Get Kernel Version & Source
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         kernel_ver="${{ needs.check_update.outputs.kernel_ver }}"
