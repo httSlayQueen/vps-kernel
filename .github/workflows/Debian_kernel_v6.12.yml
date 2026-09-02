@@ -1,0 +1,278 @@
+name: Debian Cloud Kernel (Linux v6.12.x)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_method:
+        description: 'Source download method (源码获取方式)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - git
+  schedule:
+    - cron: '0 13 * * 2'
+
+env:
+  UPLOAD_DIR: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: debian-cloud-kernel
+  cancel-in-progress: false
+
+jobs:
+  check_update:
+    runs-on: ubuntu-latest
+    outputs:
+      build_needed: ${{ steps.check.outputs.build_needed }}
+      kernel_ver: ${{ steps.check.outputs.kernel_ver }}
+    steps:
+      - name: Check latest kernel version
+        id: check
+        run: |
+          # 获取最新 LTS 版内核版本号
+          sublevel=$(curl -s -G -d 'h=linux-6.12.y' https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/Makefile | grep "^SUBLEVEL" | awk -F"= " '{print $2}')
+          if [ -z "$sublevel" ]; then
+            kernel_ver=""
+          else
+            kernel_ver="6.12.${sublevel}"
+          fi
+
+          if [ -z "$kernel_ver" ] || [ "$kernel_ver" == "null" ]; then
+            echo "Error: Failed to fetch kernel version from git.kernel.org."
+            exit 1
+          fi
+
+          echo "Latest stable kernel version is: $kernel_ver"
+          echo "kernel_ver=$kernel_ver" >> $GITHUB_OUTPUT
+
+          # --limit 200：gh release list 默认只列 30 条，Release 攒多了会误判「没构建过」而重复编译
+          if gh release list --limit 200 -R ${{ github.repository }} | grep -q "Debian_Kernel_Cloud_${kernel_ver}_bbr"; then
+            echo "Kernel $kernel_ver has already been released."
+            if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+              echo "Manual trigger detected. Forcing build."
+              echo "build_needed=true" >> $GITHUB_OUTPUT
+            else
+              echo "build_needed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Kernel $kernel_ver is new. Build needed."
+            echo "build_needed=true" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check_update
+    # 只有当 check_update 判定需要编译时才执行此 Job
+    if: needs.check_update.outputs.build_needed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        # this might remove tools that are actually needed,
+        # if set to "true" but frees about 6 GB
+        tool-cache: false
+        
+        # all of these default to true, but feel free to set to
+        # "false" if necessary for your workflow
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: true
+        swap-storage: true
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison zstd xz-utils wget curl aria2 debhelper libdw-dev rsync fakeroot
+
+    - name: Get Kernel Version & Source
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        kernel_ver="${{ needs.check_update.outputs.kernel_ver }}"
+        echo "kernel_ver=$kernel_ver" >> $GITHUB_ENV
+        echo "FILE_DATE=Kernel_Debian_Cloud_${kernel_ver}_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+        # 提取主版本号 (例如 7.1.4 提取出 7，用于拼接 CDN 路径 v7.x)
+        MAJOR_VER=$(echo $kernel_ver | cut -d. -f1)
+        TARBALL_URL="https://cdn.kernel.org/pub/linux/kernel/v${MAJOR_VER}.x/linux-${kernel_ver}.tar.xz"
+        GIT_URL="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git"
+
+        # 判断获取模式 (定时任务触发时 inputs 为空，默认设为 auto)
+        FETCH_METHOD="${{ github.event.inputs.source_method }}"
+        if [ -z "$FETCH_METHOD" ]; then
+          FETCH_METHOD="auto"
+        fi
+
+        echo "Selected fetch method: $FETCH_METHOD"
+
+        if [ "$FETCH_METHOD" = "auto" ]; then
+          echo "Downloading via aria2c (16 连接并发，抗单流卡顿): $TARBALL_URL"
+          # aria2c 多连接下载：cdn.kernel.org(Fastly) 偶发单流限速/卡顿(日志里 21K/s 那种)，
+          # 16 条连接里某条卡住其余仍在跑，实测比 wget 单流稳且快。失败再退回 git clone。
+          if aria2c -x16 -s16 -k1M --max-tries=3 --retry-wait=3 \
+               --summary-interval=0 --console-log-level=warn \
+               -o linux.tar.xz "$TARBALL_URL"; then
+            echo "Download OK. Extracting tarball..."
+            if tar -xf linux.tar.xz; then
+              rm -f linux.tar.xz
+            else
+              echo "Warning: 解压失败(下载可能损坏)，回退 Git clone..."
+              rm -f linux.tar.xz
+              git clone --depth 1 --branch "v${kernel_ver}" "$GIT_URL" linux-$kernel_ver
+            fi
+          else
+            echo "Warning: aria2c download failed! Falling back to Git clone..."
+            rm -f linux.tar.xz
+            git clone --depth 1 --branch "v${kernel_ver}" "$GIT_URL" linux-$kernel_ver
+          fi
+        else
+          echo "Manual override: Forcing Git clone from $GIT_URL..."
+          git clone --depth 1 --branch "v${kernel_ver}" "$GIT_URL" linux-$kernel_ver
+        fi
+
+        # 源码目录必须真的存在，否则后面 working-directory 会以一个诡异的错误失败
+        if [ ! -d "$GITHUB_WORKSPACE/linux-$kernel_ver" ]; then
+          echo "错误: 源码目录 linux-$kernel_ver 不存在，源码获取失败"
+          exit 1
+        fi
+        echo "KERNEL_DIR=$GITHUB_WORKSPACE/linux-$kernel_ver" >> $GITHUB_ENV
+
+    - name: Configure Kernel (Debian/Ubuntu Cloud & Panel Optimized)
+      working-directory: ${{ env.KERNEL_DIR }}
+      run: |
+        set -euo pipefail
+        make x86_64_defconfig
+
+        # ---- 公共配置：与 CentOS 流水线共用同一份权威来源，杜绝漂移 ----
+        bash "$GITHUB_WORKSPACE/kernel-config-common.sh" apply
+
+        # ==========================================
+        # Debian 专属：原生 AppArmor 安全链
+        # 这是与 CentOS 唯一真正需要区分的地方
+        # ==========================================
+        scripts/config --enable CONFIG_SECURITY_APPARMOR
+        scripts/config --enable CONFIG_SECURITY_APPARMOR_BOOTPARAM
+        scripts/config --enable CONFIG_DEFAULT_SECURITY_APPARMOR
+        scripts/config --enable CONFIG_SECURITY_APPARMOR_HASH    # 加快开机策略加载
+        # 严格匹配 Debian 12 默认的 LSM 加载顺序
+        scripts/config --set-str CONFIG_LSM "landlock,lockdown,yama,loadpin,safesetid,integrity,apparmor,bpf"
+
+        # 生成最终内核配置
+        make olddefconfig
+
+        # ---- 关键：校验配置真的生效 ----
+        # olddefconfig 会静默丢弃依赖不满足的选项，不校验就等于盲编
+        bash "$GITHUB_WORKSPACE/kernel-config-common.sh" verify debian
+
+    - name: Compile Kernel
+      working-directory: ${{ env.KERNEL_DIR }}
+      run: |
+        set -euo pipefail
+        echo "$(nproc) thread compile"
+
+        # ★ 不再使用 sudo 编译：
+        #   runner 用户本就拥有整个 workspace，sudo 只会产生 root 属主的文件，
+        #   这正是原先「Permission denied」以及被迫用 -j1 打包的根因。
+        #   去掉 sudo 后打包也能并行，模块 XZ 压缩这一步能快数倍。
+        #   （若某天 bindeb-pkg 在并行下出现竞态，把下面的 -j$(nproc) 改回 -j1 即可）
+        time make -j"$(nproc)"
+        time make -j"$(nproc)" bindeb-pkg KDEB_COMPRESS=xz
+
+        mkdir -p "$GITHUB_WORKSPACE/upload"
+
+        # bindeb-pkg 把 .deb 生成在源码目录的【上一级】
+        mv "$GITHUB_WORKSPACE"/*.deb "$GITHUB_WORKSPACE/upload/" 2>/dev/null || true
+
+        # ★ 产物非空校验：防止发布一个没有任何文件的空 Release
+        deb_count=$(find "$GITHUB_WORKSPACE/upload" -type f -name '*.deb' | wc -l)
+        if [ "$deb_count" -eq 0 ]; then
+          echo "错误: 没有产出任何 .deb 包，构建视为失败"
+          exit 1
+        fi
+        echo "已产出 ${deb_count} 个 deb 包:"
+        ls -lh "$GITHUB_WORKSPACE/upload/"
+        df -h
+
+        echo "compile_status=success" >> $GITHUB_ENV
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v7
+      if: ${{ env.compile_status == 'success' && env.UPLOAD_DIR == 'true' }}
+      with:
+        name: ${{ env.FILE_DATE }}
+        path: ${{ github.workspace }}/upload/
+
+    - name: Generate release tag
+      if: ${{ env.UPLOAD_RELEASE == 'true' && env.compile_status == 'success' && !cancelled() }}
+      run: |
+        set -euo pipefail
+        echo "release_tag=Debian_Kernel_Cloud_${{ env.kernel_ver }}_bbr_$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        cat > release.txt <<EOF
+        ## Debian / Ubuntu 系云内核 ${{ env.kernel_ver }}
+
+        面向 VPS，兼容轻量 NAS、PVE、软路由。默认启用 BBR + FQ。
+
+        ### 安装
+        \`\`\`bash
+        sudo dpkg -i linux-image-*.deb linux-headers-*.deb
+        # 开机默认启用 BBR + FQ(内核已内建 BBR，FQ 队列用 sysctl 开启最稳妥)
+        echo -e "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr" | sudo tee /etc/sysctl.d/99-bbr.conf
+        sudo sysctl --system
+        sudo update-grub
+        sudo reboot
+        \`\`\`
+
+        ### 主要特性
+        - 拥塞控制默认 BBR(已内建)；FQ 队列建议用上面的 sysctl 开启
+        - 全云平台驱动：KVM/virtio、Xen、Hyper-V、VMware、AWS ENA/Nitro、GCP GVE
+        - 容器全栈：Docker/Podman 所需 overlayfs、cgroup、netfilter NAT 全开
+        - PVE 宿主：KVM、VFIO 直通、IOMMU、OVS、VLAN、LVM Thin
+        - 防火墙：nftables + iptables + ipset + AppArmor + BPF LSM
+        - 内存优化：MGLRU、DAMON、ZRAM/ZSWAP
+        - 模块采用 XZ 压缩，兼容 Debian 10/11 等 kmod < 29 的系统
+
+        > 构建时已自动校验关键配置项均真实生效。
+        EOF
+
+    - name: Upload Kernel to Release
+      if: ${{ env.UPLOAD_RELEASE == 'true' && env.compile_status == 'success' && !cancelled() }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        gh release create "${{ env.release_tag }}" \
+          "$GITHUB_WORKSPACE"/upload/* \
+          --title "Debian Cloud Kernel ${{ env.kernel_ver }} (BBR)" \
+          --notes-file release.txt
+
+    # 用 gh CLI 清理，替代 Mattraks/delete-workflow-runs（老 Node20 action）
+    - name: Prune old workflow runs
+      if: ${{ !cancelled() }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        echo "保留最近 3 次运行，其余删除（进行中的当前 run 会被自动跳过）"
+        gh run list --workflow "${{ github.workflow }}" --limit 200 \
+          --json databaseId,createdAt \
+          --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].databaseId' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              echo "  删除 run: $id"
+              gh run delete "$id" || true
+            done
